@@ -1,0 +1,339 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Create project files
+        run: |
+          cat > settings.gradle.kts <<'LANCHAT_EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "LanChat"
+          include(":app")
+          LANCHAT_EOF
+          cat > build.gradle.kts <<'LANCHAT_EOF'
+          plugins {
+              id("com.android.application") version "8.7.3" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+          }
+          LANCHAT_EOF
+          mkdir -p app
+          cat > app/build.gradle.kts <<'LANCHAT_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.lanchat"
+              compileSdk = 35
+
+              defaultConfig {
+                  applicationId = "com.lanchat"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+          LANCHAT_EOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'LANCHAT_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+
+              <application
+                  android:label="دردشة محلية"
+                  android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          LANCHAT_EOF
+          mkdir -p app/src/main/java/com/lanchat
+          cat > app/src/main/java/com/lanchat/MainActivity.kt <<'LANCHAT_EOF'
+          package com.lanchat
+
+          import android.app.Activity
+          import android.content.Context
+          import android.graphics.Color
+          import android.graphics.drawable.GradientDrawable
+          import android.net.wifi.WifiManager
+          import android.os.Bundle
+          import android.view.Gravity
+          import android.view.View
+          import android.view.inputmethod.EditorInfo
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+          import java.net.DatagramPacket
+          import java.net.DatagramSocket
+          import java.net.InetAddress
+          import java.net.InetSocketAddress
+          import java.net.NetworkInterface
+          import java.util.UUID
+          import kotlin.concurrent.thread
+
+          class MainActivity : Activity() {
+
+              private val port = 45678
+              private val sep = "\u0001"
+              private val magic = "LANCHAT1"
+              private val myId = UUID.randomUUID().toString().take(8)
+
+              private lateinit var list: LinearLayout
+              private lateinit var scroll: ScrollView
+              private lateinit var nameBox: EditText
+              private lateinit var msgBox: EditText
+              private var mcLock: WifiManager.MulticastLock? = null
+              @Volatile private var running = true
+              private var recvSocket: DatagramSocket? = null
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  buildUi()
+                  try {
+                      val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+                      mcLock = wm.createMulticastLock("lanchat").apply {
+                          setReferenceCounted(false)
+                          acquire()
+                      }
+                  } catch (_: Exception) {
+                  }
+                  startReceiver()
+              }
+
+              private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+              private fun buildUi() {
+                  val match = LinearLayout.LayoutParams.MATCH_PARENT
+                  val wrap = LinearLayout.LayoutParams.WRAP_CONTENT
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setBackgroundColor(Color.parseColor("#ECE5DD"))
+                  }
+
+                  val title = TextView(this).apply {
+                      this.text = "💬 دردشة محلية"
+                      setTextColor(Color.WHITE)
+                      textSize = 20f
+                      setBackgroundColor(Color.parseColor("#075E54"))
+                      setPadding(dp(16), dp(14), dp(16), dp(14))
+                  }
+
+                  val prefs = getSharedPreferences("chat", MODE_PRIVATE)
+                  nameBox = EditText(this).apply {
+                      hint = "اسمك"
+                      setSingleLine(true)
+                      setText(prefs.getString("name", ""))
+                      setPadding(dp(16), dp(12), dp(16), dp(12))
+                  }
+
+                  list = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(8), dp(8), dp(8), dp(8))
+                  }
+                  scroll = ScrollView(this).apply { addView(list) }
+
+                  msgBox = EditText(this).apply {
+                      hint = "اكتب رسالة..."
+                      setSingleLine(true)
+                      imeOptions = EditorInfo.IME_ACTION_SEND
+                      setOnEditorActionListener { _, actionId, _ ->
+                          if (actionId == EditorInfo.IME_ACTION_SEND) {
+                              send()
+                              true
+                          } else {
+                              false
+                          }
+                      }
+                  }
+                  val sendBtn = Button(this).apply {
+                      this.text = "إرسال"
+                      setOnClickListener { send() }
+                  }
+                  val row = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      setPadding(dp(8), dp(4), dp(8), dp(4))
+                      addView(msgBox, LinearLayout.LayoutParams(0, wrap, 1f))
+                      addView(sendBtn, LinearLayout.LayoutParams(wrap, wrap))
+                  }
+
+                  root.addView(title, LinearLayout.LayoutParams(match, wrap))
+                  root.addView(nameBox, LinearLayout.LayoutParams(match, wrap))
+                  root.addView(scroll, LinearLayout.LayoutParams(match, 0, 1f))
+                  root.addView(row, LinearLayout.LayoutParams(match, wrap))
+                  setContentView(root)
+              }
+
+              private fun addMsg(who: String, body: String, mine: Boolean) {
+                  val tv = TextView(this).apply {
+                      this.text = who + "\n" + body
+                      setTextColor(Color.BLACK)
+                      textSize = 16f
+                      setPadding(dp(12), dp(8), dp(12), dp(8))
+                      background = GradientDrawable().apply {
+                          cornerRadius = dp(10).toFloat()
+                          setColor(Color.parseColor(if (mine) "#DCF8C6" else "#FFFFFF"))
+                      }
+                  }
+                  val lp = LinearLayout.LayoutParams(
+                      LinearLayout.LayoutParams.WRAP_CONTENT,
+                      LinearLayout.LayoutParams.WRAP_CONTENT
+                  )
+                  lp.setMargins(0, dp(4), 0, dp(4))
+                  lp.gravity = if (mine) Gravity.END else Gravity.START
+                  list.addView(tv, lp)
+                  scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
+              }
+
+              private fun startReceiver() {
+                  thread(isDaemon = true) {
+                      try {
+                          val s = DatagramSocket(null)
+                          s.reuseAddress = true
+                          s.broadcast = true
+                          s.bind(InetSocketAddress(port))
+                          recvSocket = s
+                          val buf = ByteArray(8192)
+                          while (running) {
+                              val p = DatagramPacket(buf, buf.size)
+                              s.receive(p)
+                              val raw = String(p.data, 0, p.length, Charsets.UTF_8)
+                              val parts = raw.split(sep, limit = 4)
+                              if (parts.size == 4 && parts[0] == magic && parts[1] != myId) {
+                                  runOnUiThread { addMsg(parts[2], parts[3], false) }
+                              }
+                          }
+                      } catch (e: Exception) {
+                          if (running) {
+                              runOnUiThread {
+                                  Toast.makeText(this, "خطأ استقبال: " + e.message, Toast.LENGTH_LONG).show()
+                              }
+                          }
+                      }
+                  }
+              }
+
+              private fun send() {
+                  val body = msgBox.text.toString().trim()
+                  if (body.isEmpty()) return
+                  val typed = nameBox.text.toString().trim()
+                  val who = if (typed.isEmpty()) "مجهول" else typed
+                  getSharedPreferences("chat", MODE_PRIVATE).edit().putString("name", typed).apply()
+                  msgBox.setText("")
+                  addMsg(who, body, true)
+                  val data = (magic + sep + myId + sep + who + sep + body).toByteArray(Charsets.UTF_8)
+                  thread(isDaemon = true) {
+                      try {
+                          DatagramSocket().use { s ->
+                              s.broadcast = true
+                              for (addr in broadcastAddresses()) {
+                                  try {
+                                      s.send(DatagramPacket(data, data.size, addr, port))
+                                  } catch (_: Exception) {
+                                  }
+                              }
+                          }
+                      } catch (_: Exception) {
+                      }
+                  }
+              }
+
+              @Suppress("DEPRECATION")
+              private fun broadcastAddresses(): List<InetAddress> {
+                  val out = LinkedHashSet<InetAddress>()
+                  try {
+                      val nis = NetworkInterface.getNetworkInterfaces()?.toList() ?: emptyList()
+                      for (ni in nis) {
+                          if (!ni.isUp || ni.isLoopback) continue
+                          for (ia in ni.interfaceAddresses) {
+                              val b = ia.broadcast
+                              if (b != null) out.add(b)
+                          }
+                      }
+                  } catch (_: Exception) {
+                  }
+                  try {
+                      val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+                      val d = wm.dhcpInfo
+                      if (d != null && d.ipAddress != 0) {
+                          val b = (d.ipAddress and d.netmask) or d.netmask.inv()
+                          val bytes = ByteArray(4) { i -> ((b shr (8 * i)) and 0xff).toByte() }
+                          out.add(InetAddress.getByAddress(bytes))
+                      }
+                  } catch (_: Exception) {
+                  }
+                  try {
+                      out.add(InetAddress.getByName("255.255.255.255"))
+                  } catch (_: Exception) {
+                  }
+                  return out.toList()
+              }
+
+              override fun onDestroy() {
+                  running = false
+                  try {
+                      recvSocket?.close()
+                  } catch (_: Exception) {
+                  }
+                  try {
+                      mcLock?.release()
+                  } catch (_: Exception) {
+                  }
+                  super.onDestroy()
+              }
+          }
+          LANCHAT_EOF
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+      - name: Build
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lan-chat-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
